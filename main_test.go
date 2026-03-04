@@ -154,21 +154,31 @@ func TestParseUpdateRequest_IPv6(t *testing.T) {
 	}
 }
 
-func TestSplitHostname(t *testing.T) {
+func TestFindDomain(t *testing.T) {
+	domains := []linodego.Domain{
+		{ID: 1, Domain: "example.com"},
+		{ID: 2, Domain: "samuels.xyz"},
+		{ID: 3, Domain: "sub.example.com"},
+	}
+
 	tests := []struct {
-		input      string
-		wantName   string
-		wantDomain string
+		hostname     string
+		wantName     string
+		wantDomainID int
+		wantFound    bool
 	}{
-		{"sub.example.com", "sub", "example.com"},
-		{"example.com", "", "example.com"},
-		{"deep.sub.example.com", "deep", "sub.example.com"},
+		{"sub.example.com", "", 3, true},              // exact match on sub.example.com domain
+		{"example.com", "", 1, true},                   // bare domain
+		{"foo.example.com", "foo", 1, true},            // subdomain of example.com
+		{"dvr.33m.samuels.xyz", "dvr.33m", 2, true},   // multi-level subdomain
+		{"unknown.org", "", 0, false},                  // no match
+		{"deep.sub.example.com", "deep", 3, true},     // prefers longer domain match
 	}
 	for _, tt := range tests {
-		name, domain := splitHostname(tt.input)
-		if name != tt.wantName || domain != tt.wantDomain {
-			t.Errorf("splitHostname(%q) = (%q, %q), want (%q, %q)",
-				tt.input, name, domain, tt.wantName, tt.wantDomain)
+		name, domainID, found := findDomain(tt.hostname, domains)
+		if found != tt.wantFound || domainID != tt.wantDomainID || name != tt.wantName {
+			t.Errorf("findDomain(%q) = (%q, %d, %v), want (%q, %d, %v)",
+				tt.hostname, name, domainID, found, tt.wantName, tt.wantDomainID, tt.wantFound)
 		}
 	}
 }
@@ -282,7 +292,7 @@ func TestUpdateDNS_Live(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 	const domainName = "aselia.me"
-	recordNames := []string{"testdomain0", "testdomain1"}
+	recordNames := []string{"testdomain0", "testdomain1.testsubdomain"}
 
 	// Pre-test cleanup: delete any leftover records.
 	deleteTestRecords(t, client, domainName, recordNames)
@@ -292,8 +302,8 @@ func TestUpdateDNS_Live(t *testing.T) {
 		deleteTestRecords(t, client, domainName, recordNames)
 	})
 
-	// Parse multi-hostname request.
-	recs, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.aselia.me", "1.2.3.4", "")
+	// Parse multi-hostname request (second hostname has deeper subdomain).
+	recs, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.testsubdomain.aselia.me", "1.2.3.4", "")
 	if errStr != "" {
 		t.Fatalf("parseUpdateRequests: %s", errStr)
 	}
@@ -315,7 +325,7 @@ func TestUpdateDNS_Live(t *testing.T) {
 	}
 
 	// Second update: change both to 5.6.7.8.
-	recs2, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.aselia.me", "5.6.7.8", "")
+	recs2, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.testsubdomain.aselia.me", "5.6.7.8", "")
 	if errStr != "" {
 		t.Fatalf("parseUpdateRequests: %s", errStr)
 	}
@@ -392,7 +402,7 @@ func TestServerE2E_Live(t *testing.T) {
 	linodeClient := linodego.NewClient(oauth2Client)
 
 	const domainName = "aselia.me"
-	recordNames := []string{"testdomain2", "testdomain3"}
+	recordNames := []string{"testdomain2", "testdomain3.testsubdomain"}
 
 	// Pre-test cleanup.
 	deleteTestRecords(t, linodeClient, domainName, recordNames)
@@ -402,8 +412,8 @@ func TestServerE2E_Live(t *testing.T) {
 		deleteTestRecords(t, linodeClient, domainName, recordNames)
 	})
 
-	// First request: update both hostnames to 1.2.3.4.
-	url1 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.aselia.me&myip=1.2.3.4", port)
+	// First request: update both hostnames to 1.2.3.4 (second has deeper subdomain).
+	url1 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.testsubdomain.aselia.me&myip=1.2.3.4", port)
 	req1, err := http.NewRequest("GET", url1, nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
@@ -440,7 +450,7 @@ func TestServerE2E_Live(t *testing.T) {
 	}
 
 	// Second request: update both to 5.6.7.8.
-	url2 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.aselia.me&myip=5.6.7.8", port)
+	url2 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.testsubdomain.aselia.me&myip=5.6.7.8", port)
 	req2, err := http.NewRequest("GET", url2, nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)

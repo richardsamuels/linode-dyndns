@@ -122,20 +122,32 @@ func parseUpdateRequests(hostname, myip, remoteAddr string) ([]UpdateRecord, str
 	return records, ""
 }
 
-// splitHostname splits an FQDN into the record name and domain.
-// e.g. "sub.example.com" → ("sub", "example.com")
-// e.g. "example.com" → ("", "example.com")
-func splitHostname(hostname string) (name, domain string) {
-	parts := strings.SplitN(hostname, ".", 2)
-	if len(parts) < 2 {
-		return "", hostname
+// findDomain matches hostname against a list of Linode domains, returning
+// the domain ID and the record name (the prefix before the domain).
+// Uses longest-match so "samuels.xyz" is preferred over "xyz" for "dvr.33m.samuels.xyz".
+// e.g. hostname="dvr.33m.samuels.xyz", domain="samuels.xyz" → name="dvr.33m", domainID=123
+// e.g. hostname="samuels.xyz", domain="samuels.xyz" → name="", domainID=123
+func findDomain(hostname string, domains []linodego.Domain) (name string, domainID int, found bool) {
+	var bestDomain string
+	for _, d := range domains {
+		if hostname == d.Domain {
+			// Exact match — bare domain, record name is empty.
+			if len(d.Domain) > len(bestDomain) {
+				name = ""
+				domainID = d.ID
+				bestDomain = d.Domain
+				found = true
+			}
+		} else if strings.HasSuffix(hostname, "."+d.Domain) {
+			if len(d.Domain) > len(bestDomain) {
+				name = strings.TrimSuffix(hostname, "."+d.Domain)
+				domainID = d.ID
+				bestDomain = d.Domain
+				found = true
+			}
+		}
 	}
-	// Check if the second part contains a dot — if so, first part is the subdomain.
-	if strings.Contains(parts[1], ".") {
-		return parts[0], parts[1]
-	}
-	// Bare domain like "example.com".
-	return "", hostname
+	return
 }
 
 // isLinodeAuthError returns true if the error is a 401 or 403 from the Linode API.
@@ -150,31 +162,22 @@ func isLinodeAuthError(err error) bool {
 // updateDNS performs the Linode API calls to update the DNS record.
 // Returns a DynDNS response string like "good 1.2.3.4" and whether the error is fatal (token auth failure).
 func updateDNS(ctx context.Context, client linodego.Client, logger *slog.Logger, req UpdateRecord) (string, bool) {
-	name, domainName := splitHostname(req.Hostname)
 	ipStr := req.IP.String()
 
-	logger.Info("updating DNS", "hostname", req.Hostname, "name", name, "domain", domainName, "ip", ipStr)
-
-	// Find the domain.
+	// Find the domain by matching hostname against Linode domains.
 	domains, err := client.ListDomains(ctx, nil)
 	if err != nil {
 		logger.Error("failed to list domains", "error", err)
 		return "dnserr", isLinodeAuthError(err)
 	}
 
-	var domainID int
-	var found bool
-	for _, d := range domains {
-		if d.Domain == domainName {
-			domainID = d.ID
-			found = true
-			break
-		}
-	}
+	name, domainID, found := findDomain(req.Hostname, domains)
 	if !found {
-		logger.Warn("domain not found", "domain", domainName)
+		logger.Warn("domain not found", "hostname", req.Hostname)
 		return "nohost", false
 	}
+
+	logger.Info("updating DNS", "hostname", req.Hostname, "name", name, "domain_id", domainID, "ip", ipStr)
 
 	// Determine record type.
 	recordType := linodego.RecordTypeA
