@@ -107,6 +107,21 @@ func parseUpdateRequest(hostname, myip, remoteAddr string) (UpdateRecord, string
 	return UpdateRecord{Hostname: hostname, IP: ip}, ""
 }
 
+// parseUpdateRequests splits a comma-separated hostname string and validates each entry.
+// Returns a slice of UpdateRecords or a DynDNS error string on the first invalid entry.
+func parseUpdateRequests(hostname, myip, remoteAddr string) ([]UpdateRecord, string) {
+	hostnames := strings.Split(hostname, ",")
+	records := make([]UpdateRecord, 0, len(hostnames))
+	for _, h := range hostnames {
+		rec, errStr := parseUpdateRequest(strings.TrimSpace(h), myip, remoteAddr)
+		if errStr != "" {
+			return nil, errStr
+		}
+		records = append(records, rec)
+	}
+	return records, ""
+}
+
 // splitHostname splits an FQDN into the record name and domain.
 // e.g. "sub.example.com" → ("sub", "example.com")
 // e.g. "example.com" → ("", "example.com")
@@ -250,7 +265,7 @@ func main() {
 
 		reqLogger.Info("update request", "hostname", hostname, "myip", myip, "remote_addr", r.RemoteAddr)
 
-		rec, errStr := parseUpdateRequest(hostname, myip, r.RemoteAddr)
+		recs, errStr := parseUpdateRequests(hostname, myip, r.RemoteAddr)
 		if errStr != "" {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, errStr)
@@ -258,19 +273,35 @@ func main() {
 			return
 		}
 
-		result, fatal := updateDNS(r.Context(), client, reqLogger, rec)
-
-		switch {
-		case strings.HasPrefix(result, "good"), strings.HasPrefix(result, "nochg"):
-			w.WriteHeader(http.StatusOK)
-		case result == "nohost":
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			w.WriteHeader(http.StatusInternalServerError)
+		var results []string
+		var firstErrStatus int
+		var anyFatal bool
+		for _, rec := range recs {
+			result, fatal := updateDNS(r.Context(), client, reqLogger, rec)
+			results = append(results, result)
+			if fatal {
+				anyFatal = true
+			}
+			if firstErrStatus == 0 {
+				switch {
+				case strings.HasPrefix(result, "good"), strings.HasPrefix(result, "nochg"):
+					// ok
+				case result == "nohost":
+					firstErrStatus = http.StatusNotFound
+				default:
+					firstErrStatus = http.StatusInternalServerError
+				}
+			}
 		}
-		fmt.Fprint(w, result)
 
-		if fatal {
+		if firstErrStatus != 0 {
+			w.WriteHeader(firstErrStatus)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		fmt.Fprint(w, strings.Join(results, "\n"))
+
+		if anyFatal {
 			logger.Error("API token lacks required scope, shutting down")
 			os.Exit(1)
 		}

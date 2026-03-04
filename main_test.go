@@ -173,6 +173,102 @@ func TestSplitHostname(t *testing.T) {
 	}
 }
 
+func TestParseUpdateRequests_Single(t *testing.T) {
+	recs, errStr := parseUpdateRequests("sub.example.com", "1.2.3.4", "")
+	if errStr != "" {
+		t.Fatalf("unexpected error: %s", errStr)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	if recs[0].Hostname != "sub.example.com" {
+		t.Errorf("hostname = %q, want %q", recs[0].Hostname, "sub.example.com")
+	}
+}
+
+func TestParseUpdateRequests_CommaSeparated(t *testing.T) {
+	recs, errStr := parseUpdateRequests("a.example.com,b.example.com", "1.2.3.4", "")
+	if errStr != "" {
+		t.Fatalf("unexpected error: %s", errStr)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("got %d records, want 2", len(recs))
+	}
+	if recs[0].Hostname != "a.example.com" {
+		t.Errorf("recs[0].Hostname = %q, want %q", recs[0].Hostname, "a.example.com")
+	}
+	if recs[1].Hostname != "b.example.com" {
+		t.Errorf("recs[1].Hostname = %q, want %q", recs[1].Hostname, "b.example.com")
+	}
+}
+
+func TestParseUpdateRequests_InvalidInList(t *testing.T) {
+	_, errStr := parseUpdateRequests("a.example.com,localhost", "1.2.3.4", "")
+	if errStr != "notfqdn" {
+		t.Errorf("error = %q, want %q", errStr, "notfqdn")
+	}
+}
+
+// deleteTestRecords finds the domain and deletes any A records matching the given names.
+func deleteTestRecords(t *testing.T, client linodego.Client, domainName string, recordNames []string) {
+	t.Helper()
+	domains, err := client.ListDomains(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("deleteTestRecords: failed to list domains: %v", err)
+	}
+	for _, d := range domains {
+		if d.Domain != domainName {
+			continue
+		}
+		records, err := client.ListDomainRecords(context.Background(), d.ID, nil)
+		if err != nil {
+			t.Fatalf("deleteTestRecords: failed to list records: %v", err)
+		}
+		nameSet := make(map[string]bool, len(recordNames))
+		for _, n := range recordNames {
+			nameSet[n] = true
+		}
+		for _, r := range records {
+			if r.Type == linodego.RecordTypeA && nameSet[r.Name] {
+				if err := client.DeleteDomainRecord(context.Background(), d.ID, r.ID); err != nil {
+					t.Fatalf("deleteTestRecords: failed to delete record %d: %v", r.ID, err)
+				}
+				t.Logf("deleteTestRecords: deleted record %d (%s.%s)", r.ID, r.Name, domainName)
+			}
+		}
+		return
+	}
+}
+
+// assertLinodeRecord queries the Linode API and asserts an A record exists with the expected IP.
+func assertLinodeRecord(t *testing.T, client linodego.Client, domainName, recordName, expectedIP string) {
+	t.Helper()
+	domains, err := client.ListDomains(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("assertLinodeRecord: failed to list domains: %v", err)
+	}
+	for _, d := range domains {
+		if d.Domain != domainName {
+			continue
+		}
+		records, err := client.ListDomainRecords(context.Background(), d.ID, nil)
+		if err != nil {
+			t.Fatalf("assertLinodeRecord: failed to list records: %v", err)
+		}
+		for _, r := range records {
+			if r.Type == linodego.RecordTypeA && r.Name == recordName {
+				if r.Target != expectedIP {
+					t.Errorf("assertLinodeRecord: %s.%s target = %q, want %q", recordName, domainName, r.Target, expectedIP)
+				}
+				return
+			}
+		}
+		t.Errorf("assertLinodeRecord: A record %s.%s not found", recordName, domainName)
+		return
+	}
+	t.Errorf("assertLinodeRecord: domain %s not found", domainName)
+}
+
 func TestUpdateDNS_Live(t *testing.T) {
 	token := os.Getenv("DYNDNS_FOR_LINODE_API_TOKEN")
 	if token == "" {
@@ -185,48 +281,57 @@ func TestUpdateDNS_Live(t *testing.T) {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	const hostname = "testdomain.aselia.me"
 	const domainName = "aselia.me"
-	const recordName = "testdomain"
+	recordNames := []string{"testdomain0", "testdomain1"}
 
+	// Pre-test cleanup: delete any leftover records.
+	deleteTestRecords(t, client, domainName, recordNames)
+
+	// Post-test cleanup.
 	t.Cleanup(func() {
-		domains, err := client.ListDomains(context.Background(), nil)
-		if err != nil {
-			t.Errorf("cleanup: failed to list domains: %v", err)
-			return
-		}
-		for _, d := range domains {
-			if d.Domain != domainName {
-				continue
-			}
-			records, err := client.ListDomainRecords(context.Background(), d.ID, nil)
-			if err != nil {
-				t.Errorf("cleanup: failed to list records: %v", err)
-				return
-			}
-			for _, r := range records {
-				if r.Type == linodego.RecordTypeA && r.Name == recordName {
-					if err := client.DeleteDomainRecord(context.Background(), d.ID, r.ID); err != nil {
-						t.Errorf("cleanup: failed to delete record %d: %v", r.ID, err)
-					} else {
-						t.Logf("cleanup: deleted record %d (%s.%s)", r.ID, recordName, domainName)
-					}
-				}
-			}
-			return
-		}
+		deleteTestRecords(t, client, domainName, recordNames)
 	})
 
-	result, fatal := updateDNS(context.Background(), client, logger, UpdateRecord{
-		Hostname: hostname,
-		IP:       net.ParseIP("1.2.3.4"),
-	})
-
-	if fatal {
-		t.Fatal("updateDNS reported fatal auth error")
+	// Parse multi-hostname request.
+	recs, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.aselia.me", "1.2.3.4", "")
+	if errStr != "" {
+		t.Fatalf("parseUpdateRequests: %s", errStr)
 	}
-	if result != "good 1.2.3.4" && result != "nochg 1.2.3.4" {
-		t.Errorf("unexpected result: %q", result)
+
+	// First update: set both to 1.2.3.4.
+	for _, rec := range recs {
+		result, fatal := updateDNS(context.Background(), client, logger, rec)
+		if fatal {
+			t.Fatal("updateDNS reported fatal auth error")
+		}
+		if result != "good 1.2.3.4" && result != "nochg 1.2.3.4" {
+			t.Errorf("unexpected result for %s: %q", rec.Hostname, result)
+		}
+	}
+
+	// Verify both records via API.
+	for _, name := range recordNames {
+		assertLinodeRecord(t, client, domainName, name, "1.2.3.4")
+	}
+
+	// Second update: change both to 5.6.7.8.
+	recs2, errStr := parseUpdateRequests("testdomain0.aselia.me,testdomain1.aselia.me", "5.6.7.8", "")
+	if errStr != "" {
+		t.Fatalf("parseUpdateRequests: %s", errStr)
+	}
+	for _, rec := range recs2 {
+		result, fatal := updateDNS(context.Background(), client, logger, rec)
+		if fatal {
+			t.Fatal("updateDNS reported fatal auth error")
+		}
+		if result != "good 5.6.7.8" && result != "nochg 5.6.7.8" {
+			t.Errorf("unexpected result for %s: %q", rec.Hostname, result)
+		}
+	}
+
+	// Verify both records updated.
+	for _, name := range recordNames {
+		assertLinodeRecord(t, client, domainName, name, "5.6.7.8")
 	}
 }
 
@@ -281,64 +386,92 @@ func TestServerE2E_Live(t *testing.T) {
 	// Drain remaining pipe data to avoid blocking the writer goroutine.
 	go io.Copy(io.Discard, pr)
 
-	// Cleanup: delete the testdomain2 A record from aselia.me.
+	// Create Linode client for verification.
 	tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	oauth2Client := oauth2.NewClient(context.Background(), tokenSource)
 	linodeClient := linodego.NewClient(oauth2Client)
 
+	const domainName = "aselia.me"
+	recordNames := []string{"testdomain2", "testdomain3"}
+
+	// Pre-test cleanup.
+	deleteTestRecords(t, linodeClient, domainName, recordNames)
+
+	// Post-test cleanup.
 	t.Cleanup(func() {
-		const domainName = "aselia.me"
-		const recordName = "testdomain2"
-		domains, err := linodeClient.ListDomains(context.Background(), nil)
-		if err != nil {
-			t.Errorf("cleanup: failed to list domains: %v", err)
-			return
-		}
-		for _, d := range domains {
-			if d.Domain != domainName {
-				continue
-			}
-			records, err := linodeClient.ListDomainRecords(context.Background(), d.ID, nil)
-			if err != nil {
-				t.Errorf("cleanup: failed to list records: %v", err)
-				return
-			}
-			for _, r := range records {
-				if r.Type == linodego.RecordTypeA && r.Name == recordName {
-					if err := linodeClient.DeleteDomainRecord(context.Background(), d.ID, r.ID); err != nil {
-						t.Errorf("cleanup: failed to delete record %d: %v", r.ID, err)
-					} else {
-						t.Logf("cleanup: deleted record %d (%s.%s)", r.ID, recordName, domainName)
-					}
-				}
-			}
-			return
-		}
+		deleteTestRecords(t, linodeClient, domainName, recordNames)
 	})
 
-	// Send update request.
-	url := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me&myip=1.2.3.4", port)
-	req, err := http.NewRequest("GET", url, nil)
+	// First request: update both hostnames to 1.2.3.4.
+	url1 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.aselia.me&myip=1.2.3.4", port)
+	req1, err := http.NewRequest("GET", url1, nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	req.SetBasicAuth("testuser", "testpass")
+	req1.SetBasicAuth("testuser", "testpass")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
 		t.Fatalf("HTTP request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	bodyStr1 := string(body1)
+	t.Logf("response 1: status=%d body=%q", resp1.StatusCode, bodyStr1)
 
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-	t.Logf("response: status=%d body=%q", resp.StatusCode, bodyStr)
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	if bodyStr != "good 1.2.3.4" && bodyStr != "nochg 1.2.3.4" {
-		t.Errorf("body = %q, want %q or %q", bodyStr, "good 1.2.3.4", "nochg 1.2.3.4")
+	if resp1.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp1.StatusCode, http.StatusOK)
 	}
 
+	// Expect two lines, each good/nochg.
+	lines1 := strings.Split(bodyStr1, "\n")
+	if len(lines1) != 2 {
+		t.Fatalf("expected 2 response lines, got %d: %q", len(lines1), bodyStr1)
+	}
+	for i, line := range lines1 {
+		if !strings.HasPrefix(line, "good ") && !strings.HasPrefix(line, "nochg ") {
+			t.Errorf("line %d = %q, want good/nochg prefix", i, line)
+		}
+	}
+
+	// Verify both records via Linode API.
+	for _, name := range recordNames {
+		assertLinodeRecord(t, linodeClient, domainName, name, "1.2.3.4")
+	}
+
+	// Second request: update both to 5.6.7.8.
+	url2 := fmt.Sprintf("http://localhost:%d/nic/update?hostname=testdomain2.aselia.me,testdomain3.aselia.me&myip=5.6.7.8", port)
+	req2, err := http.NewRequest("GET", url2, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req2.SetBasicAuth("testuser", "testpass")
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	bodyStr2 := string(body2)
+	t.Logf("response 2: status=%d body=%q", resp2.StatusCode, bodyStr2)
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp2.StatusCode, http.StatusOK)
+	}
+
+	lines2 := strings.Split(bodyStr2, "\n")
+	if len(lines2) != 2 {
+		t.Fatalf("expected 2 response lines, got %d: %q", len(lines2), bodyStr2)
+	}
+	for i, line := range lines2 {
+		if !strings.HasPrefix(line, "good ") && !strings.HasPrefix(line, "nochg ") {
+			t.Errorf("line %d = %q, want good/nochg prefix", i, line)
+		}
+	}
+
+	// Verify both records updated.
+	for _, name := range recordNames {
+		assertLinodeRecord(t, linodeClient, domainName, name, "5.6.7.8")
+	}
 }
